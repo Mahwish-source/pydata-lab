@@ -1,0 +1,292 @@
+# multimodal_keras.py
+"""
+Multimodal Keras demo:
+- Toy image encoder (small CNN) -> img_feat (128-d)
+- Toy text encoder (Embedding + Bi-LSTM) -> txt_feat (128-d)
+- Fusion: Gated Multimodal Unit (GMU)
+- Classifier -> 3 classes (Normal, Pneumonia, Fibrosis)
+- Missing-modality handling: modality dropout during training + zero-fill at inference
+- Uncertainty: Monte Carlo Dropout (keep dropout active at inference and run T passes)
+- Synthetic dataset included for demonstration
+"""
+
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, models, backend as K
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+import random
+
+# reproducibility
+SEED = 42
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+random.seed(SEED)
+
+# ---- Synthetic dataset ----
+class SyntheticMultiModal:
+    def __init__(self, N=1200, img_shape=(64,64,1), seq_len=30, vocab=800, n_classes=3):
+        self.N = N
+        self.img_shape = img_shape
+        self.seq_len = seq_len
+        self.vocab = vocab
+        self.n_classes = n_classes
+        # images: gaussian noise
+        self.images = np.random.randn(N, *img_shape).astype(np.float32)
+        # texts: random token ids (1..vocab-1)
+        self.texts = np.random.randint(1, vocab, size=(N, seq_len)).astype(np.int32)
+        # labels: combination rule (weak signal from both)
+        img_scores = self.images.mean(axis=(1,2,3))
+        text_scores = self.texts.mean(axis=1) / vocab
+        combined = img_scores + text_scores
+        thresholds = np.percentile(combined, [33.3, 66.6])
+        self.labels = np.digitize(combined, thresholds).astype(np.int32)  # 0,1,2
+
+    def split(self, train_frac=0.7, val_frac=0.15):
+        idx = np.arange(self.N)
+        np.random.shuffle(idx)
+        n_train = int(self.N * train_frac)
+        n_val = int(self.N * val_frac)
+        train_idx = idx[:n_train]
+        val_idx = idx[n_train:n_train+n_val]
+        test_idx = idx[n_train+n_val:]
+        def subset(i):
+            return (self.images[i], self.texts[i], self.labels[i])
+        return subset(train_idx), subset(val_idx), subset(test_idx)
+
+# ---- Encoders ----
+def build_image_encoder(input_shape=(64,64,1), out_dim=128, dropout_rate=0.3):
+    inp = layers.Input(shape=input_shape, name="image_input")
+    x = layers.Conv2D(16, 3, padding="same", activation="relu")(inp)
+    x = layers.MaxPool2D(2)(x)
+    x = layers.Conv2D(32, 3, padding="same", activation="relu")(x)
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(out_dim, activation="relu")(x)
+    x = layers.Dropout(dropout_rate)(x)
+    model = models.Model(inputs=inp, outputs=x, name="toy_image_encoder")
+    return model
+
+# NOTE: To use EfficientNetB0 (pretrained) replace build_image_encoder with:
+# from tensorflow.keras.applications import EfficientNetB0
+# base = EfficientNetB0(include_top=False, input_shape=input_shape, weights='imagenet')
+# x = base.output
+# x = layers.GlobalAveragePooling2D()(x)
+# x = layers.Dense(out_dim, activation='relu')(x)
+# img_encoder = Model(inputs=base.input, outputs=layers.Dropout(dropout_rate)(x))
+
+def build_text_encoder(seq_len=30, vocab=800, emb_dim=128, out_dim=128, dropout_rate=0.3):
+    inp = layers.Input(shape=(seq_len,), dtype="int32", name="text_input")
+    x = layers.Embedding(vocab, emb_dim, mask_zero=True)(inp)
+    x = layers.Bidirectional(layers.LSTM(128, return_sequences=True))(x)
+    x = layers.GlobalAveragePooling1D()(x)
+    x = layers.Dense(out_dim, activation="relu")(x)
+    x = layers.Dropout(dropout_rate)(x)
+    model = models.Model(inputs=inp, outputs=x, name="toy_text_encoder")
+    return model
+
+# NOTE: To use BERT/DistilBERT, use transformers to get pooled output and wrap as a Keras layer.
+
+# ---- GMU fusion as a custom layer ----
+class GMULayer(layers.Layer):
+    def __init__(self, fused_dim=256, **kwargs):
+        super().__init__(**kwargs)
+        self.fused_dim = fused_dim
+
+    def build(self, input_shape):
+        # input_shape: list of two shapes (img_feat, txt_feat) -> both (batch, dim)
+        dim_img = int(input_shape[0][-1])
+        dim_txt = int(input_shape[1][-1])
+        self.Wz = self.add_weight(shape=(dim_img + dim_txt, self.fused_dim), initializer='glorot_uniform', name='Wz')
+        self.bz = self.add_weight(shape=(self.fused_dim,), initializer='zeros', name='bz')
+        self.Uimg = self.add_weight(shape=(dim_img, self.fused_dim), initializer='glorot_uniform', name='Uimg')
+        self.Utxt = self.add_weight(shape=(dim_txt, self.fused_dim), initializer='glorot_uniform', name='Utxt')
+        super().build(input_shape)
+
+    def call(self, inputs):
+        h_img, h_txt = inputs
+        z_in = K.concatenate([h_img, h_txt], axis=-1)  # (batch, dim_img+dim_txt)
+        z = tf.sigmoid(K.dot(z_in, self.Wz) + self.bz)  # (batch, fused_dim)
+        img_part = tf.tanh(K.dot(h_img, self.Uimg))
+        txt_part = tf.tanh(K.dot(h_txt, self.Utxt))
+        fused = z * img_part + (1.0 - z) * txt_part
+        return fused
+
+# ---- Multimodal model builder ----
+def build_multimodal_model(img_shape=(64,64,1), seq_len=30, vocab=800, use_img=True, use_text=True,
+                           img_out_dim=128, txt_out_dim=128, fused_dim=256, dropout_rate=0.3):
+    # inputs
+    if use_img:
+        img_in = layers.Input(shape=img_shape, name='image_input')
+        img_encoder = build_image_encoder(input_shape=img_shape, out_dim=img_out_dim, dropout_rate=dropout_rate)
+        img_feat = img_encoder(img_in)
+    else:
+        img_in = None
+        img_feat = None
+
+    if use_text:
+        txt_in = layers.Input(shape=(seq_len,), name='text_input')
+        txt_encoder = build_text_encoder(seq_len=seq_len, vocab=vocab, emb_dim=128, out_dim=txt_out_dim, dropout_rate=dropout_rate)
+        txt_feat = txt_encoder(txt_in)
+    else:
+        txt_in = None
+        txt_feat = None
+
+    if use_img and use_text:
+        fused = GMULayer(fused_dim)([img_feat, txt_feat])
+        x = layers.Dense(128, activation='relu')(fused)
+    else:
+        x = img_feat if img_feat is not None else txt_feat
+        x = layers.Dense(128, activation='relu')(x)
+
+    x = layers.Dropout(dropout_rate)(x)
+    out = layers.Dense(3, activation='softmax', name='logits')(x)
+
+    # build model with appropriate inputs
+    inputs = []
+    if use_img: inputs.append(img_in)
+    if use_text: inputs.append(txt_in)
+    model = models.Model(inputs=inputs, outputs=out)
+    return model
+
+# ---- Utility: modality dropout wrapper for Keras training loop ----
+def apply_modality_dropout(batch_images, batch_texts, p=0.25):
+    """
+    Randomly zero-out image or text features before calling model.
+    Here we simulate at the input level: set images=0 or texts=0 with probability p each.
+    """
+    B = batch_images.shape[0]
+    # decide for each example whether to drop image or text (independently)
+    drop_img_mask = np.random.rand(B) < p
+    drop_txt_mask = np.random.rand(B) < p
+    # apply
+    images = batch_images.copy()
+    texts = batch_texts.copy()
+    images[drop_img_mask] = 0.0
+    texts[drop_txt_mask] = 0
+    return images, texts
+
+# ---- Training and evaluation ----
+def train_and_evaluate(use_img=True, use_text=True, epochs=6, batch_size=64, modality_dropout_p=0.25):
+    # prepare data
+    data = SyntheticMultiModal(N=1200, img_shape=(64,64,1), seq_len=30, vocab=800, n_classes=3)
+    (train_img, train_txt, train_y), (val_img, val_txt, val_y), (test_img, test_txt, test_y) = data.split()
+    # build model
+    model = build_multimodal_model(img_shape=(64,64,1), seq_len=30, vocab=800, use_img=use_img, use_text=use_text,
+                                   img_out_dim=128, txt_out_dim=128, fused_dim=256, dropout_rate=0.3)
+    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy')
+    print(model.summary())
+
+    # custom training loop to apply modality dropout per batch
+    steps_per_epoch = int(np.ceil(train_img.shape[0] / batch_size))
+    val_steps = int(np.ceil(val_img.shape[0] / batch_size))
+
+    for epoch in range(epochs):
+        # shuffle training set
+        idx = np.arange(train_img.shape[0])
+        np.random.shuffle(idx)
+        train_img_s = train_img[idx]; train_txt_s = train_txt[idx]; train_y_s = train_y[idx]
+        # train batches
+        for step in range(steps_per_epoch):
+            s = step * batch_size
+            e = min((step + 1) * batch_size, train_img.shape[0])
+            batch_imgs = train_img_s[s:e]
+            batch_txts = train_txt_s[s:e]
+            batch_ys = train_y_s[s:e]
+            # apply modality dropout only if both modalities are used
+            if use_img and use_text and modality_dropout_p > 0:
+                batch_imgs, batch_txts = apply_modality_dropout(batch_imgs, batch_txts, p=modality_dropout_p)
+            # prepare inputs
+            inputs = []
+            if use_img: inputs.append(batch_imgs)
+            if use_text: inputs.append(batch_txts)
+            # run training step
+            model.train_on_batch(inputs, batch_ys)
+        # validate
+        # simple deterministic evaluation (no MC)
+        if use_img and use_text:
+            preds_val = model.predict([val_img, val_txt], verbose=0)
+        elif use_img:
+            preds_val = model.predict(val_img, verbose=0)
+        else:
+            preds_val = model.predict(val_txt, verbose=0)
+        pred_labels = np.argmax(preds_val, axis=1)
+        acc = accuracy_score(val_y, pred_labels)
+        print(f"Epoch {epoch+1}/{epochs} - val_acc: {acc:.4f}")
+
+    # final test deterministic
+    if use_img and use_text:
+        preds_test = model.predict([test_img, test_txt], verbose=0)
+    elif use_img:
+        preds_test = model.predict(test_img, verbose=0)
+    else:
+        preds_test = model.predict(test_txt, verbose=0)
+    pred_labels_test = np.argmax(preds_test, axis=1)
+    acc_test = accuracy_score(test_y, pred_labels_test)
+    macro_f1 = f1_score(test_y, pred_labels_test, average='macro')
+    # AUROC multiclass
+    try:
+        auroc = roc_auc_score(np.eye(3)[test_y], preds_test, average='macro', multi_class='ovr')
+    except Exception as e:
+        auroc = float('nan')
+    metrics = {'acc': acc_test, 'macro_f1': macro_f1, 'auroc': auroc}
+
+    return model, metrics, (test_img, test_txt, test_y), preds_test
+
+# ---- Monte Carlo Dropout uncertainty ----
+def mc_dropout_predict(model, test_inputs, T=30, batch_size=64):
+    """
+    Run T stochastic forward passes with dropout active and return mean & std of predicted probabilities.
+    For Keras, we can set training=True in call to force dropout layers active.
+    """
+    # Build a function that runs model(..., training=True)
+    # Keras model call supports training=True; use predict with a wrapper:
+    preds = []
+    for t in range(T):
+        # run model with training=True to enable dropout
+        preds_t = model(test_inputs, training=True).numpy()
+        preds.append(preds_t)
+    preds = np.stack(preds, axis=0)  # shape (T, N, classes)
+    mean = preds.mean(axis=0)
+    std = preds.std(axis=0)
+    return mean, std
+
+# ---- Run experiments for three settings ----
+def run_all():
+    print("== Training Image-only ==")
+    model_img, m_img, test_data_img, preds_img = train_and_evaluate(use_img=True, use_text=False, epochs=4, batch_size=64, modality_dropout_p=0.0)
+    print("== Training Text-only ==")
+    model_txt, m_txt, test_data_txt, preds_txt = train_and_evaluate(use_img=False, use_text=True, epochs=4, batch_size=64, modality_dropout_p=0.0)
+    print("== Training Fused multimodal ==")
+    model_fused, m_fused, test_data_fused, preds_fused = train_and_evaluate(use_img=True, use_text=True, epochs=6, batch_size=64, modality_dropout_p=0.25)
+
+    # Collect metrics
+    table = {
+        "Model": ["Image-only", "Text-only", "Fused multimodal"],
+        "Accuracy": [m_img['acc'], m_txt['acc'], m_fused['acc']],
+        "Macro-F1": [m_img['macro_f1'], m_txt['macro_f1'], m_fused['macro_f1']],
+        "AUROC": [m_img['auroc'], m_txt['auroc'], m_fused['auroc']]
+    }
+    for k in table:
+        print(k, table[k])
+
+    # MC Dropout uncertainty analysis on fused model: run on test set
+    test_img, test_txt, test_y = test_data_fused
+    # prepare inputs for model call
+    mean_probs, std_probs = mc_dropout_predict(model_fused, [test_img, test_txt], T=40)
+    preds_mean = mean_probs.argmax(axis=1)
+    print("Fused test accuracy (MC mean):", accuracy_score(test_y, preds_mean))
+    print("Fused test macro-f1 (MC mean):", f1_score(test_y, preds_mean, average='macro'))
+
+    # analyze 10 random samples from test
+    Ntest = test_img.shape[0]
+    idxs = np.random.choice(Ntest, size=10, replace=False)
+    print("\n10-sample uncertainty analysis (fused model):")
+    for i in idxs:
+        mean_p = mean_probs[i]
+        std_p = std_probs[i]
+        pred = int(mean_p.argmax())
+        conf = float(mean_p.max())
+        unc = float(std_p.mean())
+        print(f"idx {i}: true={int(test_y[i])}, pred={pred}, conf={conf:.3f}, avg_std={unc:.4f}, mean_probs={np.round(mean_p,3)}, stds={np.round(std_p,4)}")
+
+if __name__ == "__main__":
+    run_all()
